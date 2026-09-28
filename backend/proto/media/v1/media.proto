@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package media.v1;
+
+option go_package = "rokko.dev/gen/media/v1;mediav1";
+
+service MediaService {
+  rpc CreateUploadURL(CreateUploadURLRequest) returns (CreateUploadURLResponse);
+  rpc ConfirmUpload(ConfirmUploadRequest) returns (Media);
+  rpc GetDownloadURL(GetDownloadURLRequest) returns (GetDownloadURLResponse);
+}
+
+message CreateUploadURLRequest {
+  string filename = 1;
+  string content_type = 2;
+  int64 size = 3;
+}
+
+message CreateUploadURLResponse {
+  string media_id = 1;
+  string upload_url = 2;
+}
+
+message ConfirmUploadRequest {
+  string media_id = 1;
+}
+
+message GetDownloadURLRequest {
+  string media_id = 1;
+}
+
+message GetDownloadURLResponse {
+  string url = 1;
+}
+
+message Media {
+  string id = 1;
+  string filename = 2;
+  string content_type = 3;
+  int64 size = 4;
+  string status = 5;
+}

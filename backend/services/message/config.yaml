@@ -1,0 +1,10 @@
+log_level: info
+grpc_addr: ":50054"
+postgres_dsn: postgres://rokko:rokko@localhost:5432/messages?sslmode=disable
+kafka_brokers:
+  - localhost:9092
+public_key_path: ../../deploy/keys/ed25519.pub
+issuer: rokko
+worker_id: 4
+guild_service_addr: localhost:50053
+user_service_addr: localhost:50052

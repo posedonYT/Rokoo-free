@@ -1,0 +1,8 @@
+log_level: info
+grpc_addr: ":50053"
+postgres_dsn: postgres://rokko:rokko@postgres:5432/guilds?sslmode=disable
+kafka_brokers:
+  - kafka:9092
+public_key_path: /keys/ed25519.pub
+issuer: rokko
+worker_id: 3

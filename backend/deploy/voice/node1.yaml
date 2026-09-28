@@ -1,0 +1,19 @@
+log_level: info
+http_addr: ":8082"
+kafka_brokers:
+  - kafka:9092
+public_key_path: /keys/ed25519.pub
+issuer: rokko
+guild_service_addr: guild:50053
+message_service_addr: message:50054
+stun_url: stun:stun.l.google.com:19302
+turn_url: turn:127.0.0.1:3478
+turn_secret: rokko-turn-secret
+turn_ttl_sec: 600
+redis_addr: redis:6379
+node_id: voice-1
+public_ws_url: ws://localhost:8082/ws
+ice_udp_port: 10000
+ice_host_ip: 127.0.0.1
+max_participants: 25
+max_video_publishers: 9

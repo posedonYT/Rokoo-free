@@ -1,0 +1,13 @@
+go 1.25.0
+
+use (
+	./gen/go
+	./pkg
+	./services/auth
+	./services/guild
+	./services/media
+	./services/message
+	./services/realtime
+	./services/user
+	./services/voice
+)

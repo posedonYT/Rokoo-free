@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS outbox;
+DROP INDEX IF EXISTS media_owner_idx;
+ALTER TABLE media DROP CONSTRAINT IF EXISTS media_status_chk;

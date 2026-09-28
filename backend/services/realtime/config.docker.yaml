@@ -1,0 +1,9 @@
+log_level: info
+http_addr: ":8081"
+redis_addr: redis:6379
+redis_password: ""
+kafka_brokers:
+  - kafka:9092
+public_key_path: /keys/ed25519.pub
+issuer: rokko
+user_service_addr: user:50052

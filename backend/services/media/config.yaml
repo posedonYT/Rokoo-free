@@ -1,0 +1,13 @@
+log_level: info
+grpc_addr: ":50055"
+postgres_dsn: postgres://rokko:rokko@localhost:5432/media?sslmode=disable
+public_key_path: ../../deploy/keys/ed25519.pub
+issuer: rokko
+worker_id: 5
+minio_endpoint: localhost:9000
+minio_access_key: rokko
+minio_secret_key: rokko-secret
+minio_bucket: rokko
+minio_secure: false
+kafka_brokers:
+  - localhost:9092

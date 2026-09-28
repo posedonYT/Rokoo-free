@@ -1,0 +1,16 @@
+log_level: info
+grpc_addr: ":50051"
+postgres_dsn: postgres://rokko:rokko@localhost:5432/auth?sslmode=disable
+redis_addr: localhost:6379
+redis_password: ""
+kafka_brokers:
+  - localhost:9092
+private_key_path: ../../deploy/keys/ed25519.key
+public_key_path: ../../deploy/keys/ed25519.pub
+access_ttl: 15m
+refresh_ttl: 720h
+issuer: rokko
+user_service_addr: localhost:50052
+login_limit: 10
+login_window: 15m
+worker_id: 1

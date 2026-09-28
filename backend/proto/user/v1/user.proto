@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package user.v1;
+
+option go_package = "rokko.dev/gen/user/v1;userv1";
+
+service UserService {
+  rpc GetMe(GetMeRequest) returns (Profile);
+  rpc UpdateProfile(UpdateProfileRequest) returns (Profile);
+  rpc GetProfile(GetProfileRequest) returns (Profile);
+  rpc SearchUsers(SearchUsersRequest) returns (SearchUsersResponse);
+  rpc SendFriendRequest(UserRef) returns (Relationship);
+  rpc AcceptFriendRequest(UserRef) returns (Relationship);
+  rpc DeclineFriendRequest(UserRef) returns (Relationship);
+  rpc RemoveFriend(UserRef) returns (Empty);
+  rpc BlockUser(UserRef) returns (Empty);
+  rpc UnblockUser(UserRef) returns (Empty);
+  rpc ListFriends(ListRequest) returns (ListRelationshipsResponse);
+  rpc ListIncomingRequests(ListRequest) returns (ListRelationshipsResponse);
+  rpc ListBlocked(ListRequest) returns (ListRelationshipsResponse);
+  rpc IsBlocked(IsBlockedRequest) returns (IsBlockedResponse);
+  rpc EnsureProfile(EnsureProfileRequest) returns (Profile);
+  rpc ListFriendIDs(ListRequest) returns (IDList);
+}
+
+message Empty {}
+
+message GetMeRequest {}
+
+message GetProfileRequest {
+  string user_id = 1;
+}
+
+message UpdateProfileRequest {
+  string display_name = 1;
+  string avatar_url = 2;
+  string status_text = 3;
+}
+
+message SearchUsersRequest {
+  string query = 1;
+  int32 limit = 2;
+}
+
+message SearchUsersResponse {
+  repeated Profile users = 1;
+}
+
+message UserRef {
+  string user_id = 1;
+}
+
+message ListRequest {}
+
+message Profile {
+  string id = 1;
+  string username = 2;
+  string discriminator = 3;
+  string display_name = 4;
+  string avatar_url = 5;
+  string status_text = 6;
+}
+
+message Relationship {
+  Profile user = 1;
+  string status = 2;
+}
+
+message ListRelationshipsResponse {
+  repeated Relationship relationships = 1;
+}
+
+message IsBlockedRequest {
+  string user_a = 1;
+  string user_b = 2;
+}
+
+message IsBlockedResponse {
+  bool blocked = 1;
+}
+
+message EnsureProfileRequest {
+  string user_id = 1;
+  string username = 2;
+}
+
+message IDList {
+  repeated string ids = 1;
+}

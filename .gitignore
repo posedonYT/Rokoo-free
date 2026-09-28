@@ -1,0 +1,12 @@
+bin/
+dist/
+out/
+node_modules/
+.next/
+*.exe
+coverage/
+.DS_Store
+playwright-report/
+test-results/
+.cursor/
+.vscode/

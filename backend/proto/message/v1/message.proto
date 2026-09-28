@@ -1,0 +1,113 @@
+syntax = "proto3";
+
+package message.v1;
+
+option go_package = "rokko.dev/gen/message/v1;messagev1";
+
+service MessageService {
+  rpc OpenDM(OpenDMRequest) returns (DMChannel);
+  rpc CreateGroupDM(CreateGroupDMRequest) returns (DMChannel);
+  rpc ListDMs(ListDMsRequest) returns (ListDMsResponse);
+  rpc AddGroupMember(GroupMemberRequest) returns (DMChannel);
+  rpc LeaveGroupDM(LeaveGroupRequest) returns (Empty);
+  rpc SendMessage(SendMessageRequest) returns (Message);
+  rpc EditMessage(EditMessageRequest) returns (Message);
+  rpc DeleteMessage(DeleteMessageRequest) returns (Empty);
+  rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
+  rpc CheckDMAccess(CheckDMAccessRequest) returns (CheckDMAccessResponse);
+  rpc ListDMMemberIDs(DMRef) returns (IDList);
+}
+
+message Empty {}
+
+message OpenDMRequest {
+  string user_id = 1;
+}
+
+message CreateGroupDMRequest {
+  repeated string user_ids = 1;
+}
+
+message ListDMsRequest {}
+
+message GroupMemberRequest {
+  string channel_id = 1;
+  string user_id = 2;
+}
+
+message LeaveGroupRequest {
+  string channel_id = 1;
+}
+
+message DMRef {
+  string channel_id = 1;
+}
+
+message DMChannel {
+  string id = 1;
+  string kind = 2;
+  repeated string member_ids = 3;
+}
+
+message ListDMsResponse {
+  repeated DMChannel channels = 1;
+}
+
+message Attachment {
+  string media_id = 1;
+  string filename = 2;
+  string content_type = 3;
+  int64 size = 4;
+}
+
+message SendMessageRequest {
+  string channel_id = 1;
+  string channel_kind = 2;
+  string content = 3;
+  repeated Attachment attachments = 4;
+}
+
+message EditMessageRequest {
+  string message_id = 1;
+  string content = 2;
+}
+
+message DeleteMessageRequest {
+  string message_id = 1;
+}
+
+message ListMessagesRequest {
+  string channel_id = 1;
+  string channel_kind = 2;
+  string before = 3;
+  int32 limit = 4;
+}
+
+message Message {
+  string id = 1;
+  string channel_id = 2;
+  string channel_kind = 3;
+  string author_id = 4;
+  string content = 5;
+  int64 created_at_unix = 6;
+  int64 edited_at_unix = 7;
+  repeated Attachment attachments = 8;
+}
+
+message ListMessagesResponse {
+  repeated Message messages = 1;
+}
+
+message CheckDMAccessRequest {
+  string channel_id = 1;
+}
+
+message CheckDMAccessResponse {
+  bool allowed = 1;
+  repeated string member_ids = 2;
+  string kind = 3;
+}
+
+message IDList {
+  repeated string ids = 1;
+}

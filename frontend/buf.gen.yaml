@@ -1,0 +1,8 @@
+version: v2
+inputs:
+  - directory: ../backend/proto
+plugins:
+  - local: protoc-gen-es
+    out: src/shared/api/gen
+    opt:
+      - target=ts

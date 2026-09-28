@@ -1,0 +1,9 @@
+log_level: info
+http_addr: ":8081"
+redis_addr: localhost:6379
+redis_password: ""
+kafka_brokers:
+  - localhost:9092
+public_key_path: ../../deploy/keys/ed25519.pub
+issuer: rokko
+user_service_addr: localhost:50052

@@ -1,0 +1,6 @@
+DROP TABLE IF EXISTS outbox;
+DROP TABLE IF EXISTS attachments;
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS dm_pairs;
+DROP TABLE IF EXISTS dm_members;
+DROP TABLE IF EXISTS dm_channels;
