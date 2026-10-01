@@ -34,6 +34,7 @@ type RefreshRotator interface {
 
 type Limiter interface {
 	Allow(ctx context.Context, key string) (bool, error)
+	Reset(ctx context.Context, keys ...string) error
 }
 
 type Profiles interface {
@@ -44,11 +45,13 @@ type RegisterInput struct {
 	Email    string `validate:"required,email,max=254"`
 	Username string `validate:"required,min=2,max=32"`
 	Password string `validate:"required,min=8,max=72"`
+	IP       string `validate:"-"`
 }
 
 type LoginInput struct {
 	Email    string `validate:"required,email"`
 	Password string `validate:"required"`
+	IP       string `validate:"-"`
 }
 
 type Tokens struct {
@@ -83,6 +86,15 @@ func (s *Service) Register(ctx context.Context, in RegisterInput) (Tokens, error
 	}
 	if !validUsername(in.Username) {
 		return Tokens{}, apperr.Invalid("username must be 2-32 chars of a-z, 0-9 or _")
+	}
+	if s.limiter != nil && in.IP != "" {
+		ok, err := s.limiter.Allow(ctx, "register:ip:"+in.IP)
+		if err != nil {
+			return Tokens{}, err
+		}
+		if !ok {
+			return Tokens{}, apperr.RateLimited("too many registration attempts")
+		}
 	}
 	hash, err := authn.HashPassword(in.Password)
 	if err != nil {
@@ -123,13 +135,25 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (Tokens, error) {
 	if err := validate.Struct(in); err != nil {
 		return Tokens{}, err
 	}
+	// Every attempt is counted up front (atomic Lua INCR) and the counters are cleared on
+	// success, so only failed attempts accumulate.
+	var limitKeys []string
 	if s.limiter != nil {
-		ok, err := s.limiter.Allow(ctx, "login:"+in.Email)
-		if err != nil {
-			return Tokens{}, err
+		ip := in.IP
+		if ip == "" {
+			ip = "unknown"
+		} else {
+			limitKeys = append(limitKeys, "login:ip:"+ip)
 		}
-		if !ok {
-			return Tokens{}, apperr.RateLimited("too many login attempts")
+		limitKeys = append(limitKeys, "login:"+in.Email+":"+ip)
+		for _, key := range limitKeys {
+			ok, err := s.limiter.Allow(ctx, key)
+			if err != nil {
+				return Tokens{}, err
+			}
+			if !ok {
+				return Tokens{}, apperr.RateLimited("too many login attempts")
+			}
 		}
 	}
 	account, err := s.store.FindByEmail(ctx, in.Email)
@@ -142,6 +166,9 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (Tokens, error) {
 	}
 	if !ok {
 		return Tokens{}, apperr.Unauthorized("invalid email or password")
+	}
+	if s.limiter != nil {
+		_ = s.limiter.Reset(ctx, limitKeys...)
 	}
 	return s.issue(ctx, account.ID, account.Username)
 }

@@ -5,6 +5,7 @@ import "sync"
 type Conn interface {
 	UserID() string
 	Send(payload []byte) bool
+	Close()
 }
 
 type Hub struct {
@@ -35,12 +36,20 @@ func (h *Hub) Remove(c Conn) {
 	}
 }
 
-func (h *Hub) Send(userID string, payload []byte) {
+func (h *Hub) Send(userID string, payload []byte) bool {
+	var dropped []Conn
 	h.mu.RLock()
-	defer h.mu.RUnlock()
 	for c := range h.conns[userID] {
-		c.Send(payload)
+		if !c.Send(payload) {
+			dropped = append(dropped, c)
+		}
 	}
+	h.mu.RUnlock()
+	for _, c := range dropped {
+		h.Remove(c)
+		c.Close()
+	}
+	return len(dropped) == 0
 }
 
 func (h *Hub) Online(userID string) bool {

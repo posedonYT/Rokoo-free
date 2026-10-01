@@ -288,6 +288,21 @@ GET /metrics    # Prometheus (rooms, peers, bytes, layer switches, …)
 
 ---
 
+## Known limitations (demo)
+
+This repository is a portfolio/demo project, not a production deployment.
+
+- `backend/deploy/keys/*` are demo JWT keys. Never reuse them. Generate your own
+  with `openssl genpkey -algorithm ed25519` and mount them via secrets.
+- Default credentials (`rokko/rokko`, `rokko-turn-secret`, `rokko-secret`) and published
+  ports for Postgres/Redis/Kafka exist for local `docker compose up` only.
+- Redis has no password/persistence; coturn has no peer IP deny-list or TLS.
+  Harden before any public deployment.
+- `ice_host_ip` / `turn_url` point to `127.0.0.1`; set to the public address for real use.
+- Services use a single Postgres superuser and `sslmode=disable` for simplicity.
+
+---
+
 ## License
 
 Use and modify this project for your own messenger product. Check individual dependency licenses in `go.mod` / `package.json`.
@@ -412,6 +427,21 @@ WebSocket для **UX звонка**: входящий ring, список уча
 ## Кастомизация
 
 Смена бренда и UI — `frontend/`. Конфиги сервисов — `backend/services/*/config.yaml` и `backend/deploy/`. Новые RPC — правки в `backend/proto` и `make proto`. Масштабирование звонков — дополнительные контейнеры `voice-N` с общим Redis.
+
+---
+
+## Известные ограничения (демо)
+
+Этот репозиторий — портфолио/демо, а не продакшен-деплой.
+
+- `backend/deploy/keys/*` — демонстрационные JWT-ключи. Не переиспользуйте их. Сгенерируйте свои
+  через `openssl genpkey -algorithm ed25519` и подключайте через secrets.
+- Учётные данные по умолчанию (`rokko/rokko`, `rokko-turn-secret`, `rokko-secret`) и открытые
+  порты Postgres/Redis/Kafka предназначены только для локального `docker compose up`.
+- У Redis нет пароля и persistence; у coturn нет deny-list peer IP и TLS.
+  Ужесточите конфигурацию перед любым публичным развёртыванием.
+- `ice_host_ip` / `turn_url` указывают на `127.0.0.1`; для реальной сети задайте публичный адрес.
+- Сервисы используют одного суперпользователя Postgres и `sslmode=disable` ради простоты.
 
 ---
 

@@ -15,8 +15,7 @@ test("register, login, create a server and send a message", async ({ page }) => 
   page.once("dialog", (dialog) => dialog.accept("E2E"));
   await page.getByTitle("Создать сервер").click();
   await page.getByTitle("E2E").click();
-  await page.getByRole("button", { name: /general|Чат|Канал/ }).first();
-  await page.getByText("general").click();
+  await page.getByRole("button", { name: "general", exact: true }).click();
   await page.getByPlaceholder("Сообщение").fill("привет");
   await page.getByRole("button", { name: "Отправить" }).click();
   await expect(page.getByText("привет")).toBeVisible();

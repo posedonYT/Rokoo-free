@@ -11,6 +11,8 @@ import (
 
 	"github.com/segmentio/kafka-go"
 	"go.uber.org/zap"
+	guildv1 "rokko.dev/gen/guild/v1"
+	messagev1 "rokko.dev/gen/message/v1"
 	userv1 "rokko.dev/gen/user/v1"
 	"rokko.dev/pkg/authn"
 	"rokko.dev/pkg/config"
@@ -53,16 +55,42 @@ func main() {
 		log.Fatal("user dial", zap.Error(err))
 	}
 	defer userConn.Close()
+	guildConn, err := grpcx.Dial(cfg.GuildServiceAddr)
+	if err != nil {
+		log.Fatal("guild dial", zap.Error(err))
+	}
+	defer guildConn.Close()
+	msgConn, err := grpcx.Dial(cfg.MessageServiceAddr)
+	if err != nil {
+		log.Fatal("message dial", zap.Error(err))
+	}
+	defer msgConn.Close()
 	st := state.New(rdb)
 	h := hub.New()
-	srv := httpserver.New(tokens, h, st, userv1.NewUserServiceClient(userConn))
+	srv := httpserver.New(tokens, h, st, userv1.NewUserServiceClient(userConn), guildv1.NewGuildServiceClient(guildConn), messagev1.NewMessageServiceClient(msgConn))
+	srv.SetOrigins(cfg.Origins)
 	writer := kafkax.NewWriter(cfg.KafkaBrokers)
 	defer writer.Close()
 	srv.SetEvents(func(ctx context.Context, topic, key string, payload []byte) error {
 		return writer.WriteMessages(ctx, kafka.Message{Topic: topic, Key: []byte(key), Value: payload})
 	})
 	srv.SetLog(func(msg string, err error) { log.Warn(msg, zap.Error(err)) })
+	srv.InitPubSub(ctx)
 	go srv.ListenRedis(ctx)
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := st.SweepAll(ctx); err != nil && ctx.Err() == nil {
+					log.Warn("sweep", zap.Error(err))
+				}
+			}
+		}
+	}()
 	go func() {
 		_ = kafkax.Consume(ctx, cfg.KafkaBrokers, "realtime", []string{"user.events", "guild.events", "message.events", "voice.events"}, func(ctx context.Context, msg kafka.Message) error {
 			var env eventx.Envelope

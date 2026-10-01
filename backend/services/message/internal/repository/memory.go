@@ -162,6 +162,24 @@ func (m *Memory) ListMessages(_ context.Context, channelID int64, before int64, 
 	return out, nil
 }
 
+func (m *Memory) DeleteByChannelIDs(_ context.Context, channelIDs []int64) (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	set := make(map[int64]struct{}, len(channelIDs))
+	for _, id := range channelIDs {
+		set[id] = struct{}{}
+	}
+	var n int64
+	for id, msg := range m.messages {
+		if _, ok := set[msg.ChannelID]; ok && msg.ChannelKind == domain.KindGuild {
+			delete(m.messages, id)
+			delete(m.deleted, id)
+			n++
+		}
+	}
+	return n, nil
+}
+
 func order(a, b int64) (int64, int64) {
 	if a < b {
 		return a, b

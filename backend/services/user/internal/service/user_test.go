@@ -94,3 +94,34 @@ func TestSearchAndUpdate(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, found, 1)
 }
+
+func TestSearchPrefixAndTag(t *testing.T) {
+	store := repository.NewMemory()
+	svc := New(store, id.New(4))
+	ctx := context.Background()
+	a, err := svc.EnsureProfile(ctx, 21, "alice")
+	require.NoError(t, err)
+	_, err = svc.EnsureProfile(ctx, 22, "alina")
+	require.NoError(t, err)
+
+	found, err := svc.Search(ctx, "ali", 10)
+	require.NoError(t, err)
+	require.Len(t, found, 2)
+
+	found, err = svc.Search(ctx, "alice#"+a.Discriminator, 10)
+	require.NoError(t, err)
+	require.Len(t, found, 1)
+	require.Equal(t, int64(21), found[0].ID)
+
+	// exact tag with wrong discriminator must not fall back to prefix
+	found, err = svc.Search(ctx, "alice#nope", 10)
+	require.NoError(t, err)
+	require.Empty(t, found)
+
+	// LIKE wildcards are treated literally
+	for _, q := range []string{"%", "_", "a%", "al_ce"} {
+		found, err = svc.Search(ctx, q, 10)
+		require.NoError(t, err)
+		require.Empty(t, found, q)
+	}
+}

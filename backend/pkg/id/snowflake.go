@@ -22,21 +22,29 @@ type Generator struct {
 	worker int64
 	last   int64
 	seq    int64
+	clock  func() int64
 }
 
 func New(worker int64) *Generator {
-	return &Generator{worker: worker & (1<<workerBits - 1)}
+	return &Generator{
+		worker: worker & (1<<workerBits - 1),
+		clock:  func() int64 { return time.Now().UnixMilli() - epochMs },
+	}
 }
 
 func (g *Generator) Next() int64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	now := time.Now().UnixMilli() - epochMs
+	now := g.clock()
+	for now < g.last {
+		time.Sleep(time.Duration(g.last-now) * time.Millisecond)
+		now = g.clock()
+	}
 	if now == g.last {
 		g.seq = (g.seq + 1) & seqMask
 		if g.seq == 0 {
 			for now <= g.last {
-				now = time.Now().UnixMilli() - epochMs
+				now = g.clock()
 			}
 		}
 	} else {

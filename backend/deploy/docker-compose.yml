@@ -113,6 +113,8 @@ services:
       redis: { condition: service_healthy }
       kafka: { condition: service_healthy }
       user: { condition: service_started }
+      guild: { condition: service_started }
+      message: { condition: service_started }
   voice-1:
     build: { context: .., dockerfile: Dockerfile, args: { SERVICE: voice } }
     restart: unless-stopped

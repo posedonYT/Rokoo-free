@@ -18,7 +18,7 @@ export type RealtimeEvent = {
 };
 
 export function connectRealtime(token: string, onEvent: (event: RealtimeEvent) => void) {
-  const socket = new WebSocket(`${wsBase}?token=${encodeURIComponent(token)}`);
+  const socket = new WebSocket(wsBase, ["rokko.v1", token]);
   const send = (body: unknown) => {
     if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(body));
   };

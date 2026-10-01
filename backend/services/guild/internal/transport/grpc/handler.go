@@ -277,6 +277,9 @@ func (h *Handler) CheckChannelAccess(ctx context.Context, req *guildv1.CheckChan
 	if err != nil {
 		return nil, err
 	}
+	if !access.Allowed {
+		return &guildv1.CheckChannelAccessResponse{Allowed: false}, nil
+	}
 	return &guildv1.CheckChannelAccessResponse{
 		Allowed: access.Allowed, GuildId: id.Format(access.GuildID), Role: access.Role,
 		CanModerate: access.CanModerate, ChannelType: access.ChannelType,

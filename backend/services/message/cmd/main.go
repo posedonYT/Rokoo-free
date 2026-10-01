@@ -22,6 +22,7 @@ import (
 	"rokko.dev/pkg/postgres"
 	"rokko.dev/services/message/internal/clients"
 	msgcfg "rokko.dev/services/message/internal/config"
+	"rokko.dev/services/message/internal/events"
 	"rokko.dev/services/message/internal/repository"
 	"rokko.dev/services/message/internal/service"
 	grpcserver "rokko.dev/services/message/internal/transport/grpc"
@@ -68,6 +69,11 @@ func main() {
 	defer writer.Close()
 	go outbox.RunRelayLogged(ctx, pool, writer, func(err error) { log.Warn("outbox", zap.Error(err)) })
 	store := repository.NewPostgres(pool)
+	go func() {
+		if err := kafkax.Consume(ctx, cfg.KafkaBrokers, "message-service", []string{"guild.events"}, events.Handle(store)); err != nil && ctx.Err() == nil {
+			log.Warn("guild events consumer stopped", zap.Error(err))
+		}
+	}()
 	svc := service.New(store, store, clients.NewGuild(guildv1.NewGuildServiceClient(guildConn)), clients.NewBlocks(userv1.NewUserServiceClient(userConn)), id.New(cfg.WorkerID))
 	srv := grpcx.NewServer(log, tokens, nil)
 	messagev1.RegisterMessageServiceServer(srv, grpcserver.New(svc))

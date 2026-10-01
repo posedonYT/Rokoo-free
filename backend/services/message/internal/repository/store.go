@@ -14,6 +14,10 @@ type MessageRepository interface {
 	ListMessages(ctx context.Context, channelID int64, before int64, limit int) ([]domain.Message, error)
 }
 
+type ChannelCleaner interface {
+	DeleteByChannelIDs(ctx context.Context, channelIDs []int64) (int64, error)
+}
+
 type DMRepository interface {
 	FindPair(ctx context.Context, a, b int64) (domain.DMChannel, bool, error)
 	CreateDM(ctx context.Context, ch domain.DMChannel) error

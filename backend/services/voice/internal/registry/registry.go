@@ -26,6 +26,20 @@ end
 return 0
 `
 
+const releaseScript = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  redis.call('DEL', KEYS[1], KEYS[2])
+  return 1
+end
+return 0
+`
+
+const upsertNodeScript = `
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4])
+return 1
+`
+
 type Node struct {
 	ID       string `json:"id"`
 	URL      string `json:"url"`
@@ -62,11 +76,8 @@ func (r *Registry) Refresh(ctx context.Context, room, nodeID string) (bool, erro
 }
 
 func (r *Registry) Release(ctx context.Context, room, nodeID string) error {
-	ok, err := r.Refresh(ctx, room, nodeID)
-	if err != nil || !ok {
-		return err
-	}
-	return r.rdb.Del(ctx, "voice:room:"+room, "voice:participants:"+room).Err()
+	_, err := r.rdb.Eval(ctx, releaseScript, []string{"voice:room:" + room, "voice:participants:" + room}, nodeID).Result()
+	return err
 }
 
 func (r *Registry) UpsertNode(ctx context.Context, n Node) error {
@@ -74,36 +85,44 @@ func (r *Registry) UpsertNode(ctx context.Context, n Node) error {
 	if err != nil {
 		return err
 	}
-	return r.rdb.Set(ctx, "voice:node:"+n.ID, raw, r.ttl).Err()
+	exp := time.Now().Add(r.ttl).UnixMilli()
+	_, err = r.rdb.Eval(ctx, upsertNodeScript,
+		[]string{"voice:node:" + n.ID, "voice:nodes"},
+		string(raw), r.ttl.Milliseconds(), exp, n.ID,
+	).Result()
+	return err
 }
 
 func (r *Registry) Nodes(ctx context.Context) ([]Node, error) {
-	var cursor uint64
-	var out []Node
-	for {
-		keys, next, err := r.rdb.Scan(ctx, cursor, "voice:node:*", 64).Result()
-		if err != nil {
-			return nil, err
+	now := time.Now().UnixMilli()
+	_ = r.rdb.ZRemRangeByScore(ctx, "voice:nodes", "-inf", fmt.Sprintf("%d", now-1)).Err()
+	ids, err := r.rdb.ZRangeByScore(ctx, "voice:nodes", &redis.ZRangeBy{
+		Min: fmt.Sprintf("%d", now),
+		Max: "+inf",
+	}).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, len(ids))
+	for i, id := range ids {
+		keys[i] = "voice:node:" + id
+	}
+	vals, err := r.rdb.MGet(ctx, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Node, 0, len(vals))
+	for _, val := range vals {
+		s, ok := val.(string)
+		if !ok || s == "" {
+			continue
 		}
-		if len(keys) > 0 {
-			vals, err := r.rdb.MGet(ctx, keys...).Result()
-			if err != nil {
-				return nil, err
-			}
-			for _, val := range vals {
-				s, ok := val.(string)
-				if !ok || s == "" {
-					continue
-				}
-				var n Node
-				if json.Unmarshal([]byte(s), &n) == nil && n.ID != "" {
-					out = append(out, n)
-				}
-			}
-		}
-		cursor = next
-		if cursor == 0 {
-			break
+		var n Node
+		if json.Unmarshal([]byte(s), &n) == nil && n.ID != "" {
+			out = append(out, n)
 		}
 	}
 	return out, nil
@@ -111,7 +130,7 @@ func (r *Registry) Nodes(ctx context.Context) ([]Node, error) {
 
 func (r *Registry) SetParticipants(ctx context.Context, room string, ids []string) error {
 	key := "voice:participants:" + room
-	pipe := r.rdb.Pipeline()
+	pipe := r.rdb.TxPipeline()
 	pipe.Del(ctx, key)
 	if len(ids) > 0 {
 		members := make([]any, len(ids))

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -87,4 +88,30 @@ func TestCheckChannelAccess(t *testing.T) {
 	outsider, err := svc.CheckChannelAccess(ctx, 99, channels[0].ID)
 	require.NoError(t, err)
 	require.False(t, outsider.Allowed)
+	require.Zero(t, outsider.GuildID)
+	require.Empty(t, outsider.ChannelType)
+	require.Empty(t, outsider.Role)
+}
+
+type roleErrStore struct {
+	repositoryStore
+	err error
+}
+
+func (s roleErrStore) Role(context.Context, int64, int64) (string, error) { return "", s.err }
+
+func TestCheckChannelAccessInfraError(t *testing.T) {
+	store := repository.NewMemory()
+	ctx := context.Background()
+	svc := New(store, id.New(8))
+	g, err := svc.CreateGuild(ctx, 1, CreateGuildInput{Name: "Voice"})
+	require.NoError(t, err)
+	channels, err := svc.ListChannels(ctx, 1, g.ID)
+	require.NoError(t, err)
+
+	boom := errors.New("db down")
+	svc.store = roleErrStore{repositoryStore: store, err: boom}
+	access, err := svc.CheckChannelAccess(ctx, 1, channels[0].ID)
+	require.ErrorIs(t, err, boom)
+	require.False(t, access.Allowed)
 }

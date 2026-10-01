@@ -302,7 +302,10 @@ func (s *Service) CheckChannelAccess(ctx context.Context, userID, channelID int6
 	}
 	role, err := s.store.Role(ctx, ch.GuildID, userID)
 	if err != nil {
-		return Access{GuildID: ch.GuildID, ChannelType: ch.Type}, nil
+		if app, ok := apperr.As(err); ok && app.Code == apperr.CodeForbidden {
+			return Access{Allowed: false}, nil
+		}
+		return Access{}, err
 	}
 	return Access{
 		Allowed: true, GuildID: ch.GuildID, Role: role,

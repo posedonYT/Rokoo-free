@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -102,13 +103,34 @@ func (p *Postgres) GetProfile(ctx context.Context, userID int64) (domain.Profile
 }
 
 func (p *Postgres) Search(ctx context.Context, query string, limit int) ([]domain.Profile, error) {
-	rows, err := p.pool.Query(ctx, `
-		SELECT id, username, discriminator, display_name, avatar_url, status_text
-		FROM profiles
-		WHERE lower(username) LIKE lower($1) || '%' OR username || '#' || discriminator = $2
-		ORDER BY username, discriminator
-		LIMIT $3
-	`, query, query, limit)
+	query = strings.ToLower(strings.TrimSpace(query))
+	var (
+		rows pgx.Rows
+		err  error
+	)
+	if name, disc, ok := parseTag(query); ok && name != "" && disc != "" {
+		rows, err = p.pool.Query(ctx, `
+			SELECT id, username, discriminator, display_name, avatar_url, status_text
+			FROM profiles
+			WHERE lower(username) = $1 AND discriminator = $2
+			ORDER BY username, discriminator
+			LIMIT $3
+		`, name, disc, limit)
+	} else {
+		if ok {
+			query = name // "name#" -> prefix search by name part
+		}
+		if query == "" {
+			return nil, nil
+		}
+		rows, err = p.pool.Query(ctx, `
+			SELECT id, username, discriminator, display_name, avatar_url, status_text
+			FROM profiles
+			WHERE lower(username) LIKE $1 || '%' ESCAPE '\'
+			ORDER BY username, discriminator
+			LIMIT $2
+		`, escapeLike(query), limit)
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -13,9 +13,10 @@ import (
 )
 
 type Identity struct {
-	UserID   int64
-	Username string
-	Token    string
+	UserID    int64
+	Username  string
+	Token     string
+	ExpiresAt time.Time
 }
 
 type ctxKey struct{}
@@ -99,7 +100,7 @@ func (m *Manager) Parse(token string) (Identity, error) {
 			return nil, fmt.Errorf("unexpected signing method")
 		}
 		return m.public, nil
-	})
+	}, jwt.WithIssuer(m.issuer), jwt.WithExpirationRequired(), jwt.WithValidMethods([]string{jwt.SigningMethodEdDSA.Alg()}))
 	if err != nil || !parsed.Valid {
 		return Identity{}, apperr.Unauthorized("invalid token")
 	}
@@ -107,5 +108,9 @@ func (m *Manager) Parse(token string) (Identity, error) {
 	if err != nil {
 		return Identity{}, apperr.Unauthorized("invalid token subject")
 	}
-	return Identity{UserID: id, Username: claims.Username, Token: token}, nil
+	ident := Identity{UserID: id, Username: claims.Username, Token: token}
+	if claims.ExpiresAt != nil {
+		ident.ExpiresAt = claims.ExpiresAt.Time
+	}
+	return ident, nil
 }

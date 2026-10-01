@@ -12,6 +12,8 @@ import (
 	"github.com/coder/websocket"
 	"github.com/gin-gonic/gin"
 	"github.com/redis/go-redis/v9"
+	guildv1 "rokko.dev/gen/guild/v1"
+	messagev1 "rokko.dev/gen/message/v1"
 	userv1 "rokko.dev/gen/user/v1"
 	"rokko.dev/pkg/authn"
 	"rokko.dev/pkg/eventx"
@@ -22,21 +24,39 @@ import (
 	"rokko.dev/services/realtime/internal/state"
 )
 
+const (
+	wsProtocol     = "rokko.v1"
+	maxSubscribe   = 200
+	maxPresenceIDs = 100
+	grpcTimeout    = 5 * time.Second
+)
+
+var defaultOrigins = []string{"localhost:*", "127.0.0.1:*"}
+
 type Server struct {
-	tokens  *authn.Manager
-	hub     *hub.Hub
-	state   *state.Redis
-	users   userv1.UserServiceClient
-	publish func(ctx context.Context, userID string, payload []byte) error
-	events  func(ctx context.Context, topic, key string, payload []byte) error
-	log     func(msg string, err error)
-	subMu   sync.Mutex
-	ps      *redis.PubSub
-	refs    map[string]int
+	tokens   *authn.Manager
+	hub      *hub.Hub
+	state    *state.Redis
+	users    userv1.UserServiceClient
+	guilds   guildv1.GuildServiceClient
+	messages messagev1.MessageServiceClient
+	origins  []string
+	publish  func(ctx context.Context, userID string, payload []byte) error
+	events   func(ctx context.Context, topic, key string, payload []byte) error
+	log      func(msg string, err error)
+	subMu    sync.Mutex
+	ps       *redis.PubSub
+	refs     map[string]int
 }
 
-func New(tokens *authn.Manager, h *hub.Hub, st *state.Redis, users userv1.UserServiceClient) *Server {
-	return &Server{tokens: tokens, hub: h, state: st, users: users, publish: st.Publish, refs: map[string]int{}}
+func New(tokens *authn.Manager, h *hub.Hub, st *state.Redis, users userv1.UserServiceClient, guilds guildv1.GuildServiceClient, messages messagev1.MessageServiceClient) *Server {
+	return &Server{tokens: tokens, hub: h, state: st, users: users, guilds: guilds, messages: messages, publish: st.Publish, refs: map[string]int{}, origins: defaultOrigins}
+}
+
+func (s *Server) SetOrigins(origins []string) {
+	if len(origins) > 0 {
+		s.origins = origins
+	}
 }
 
 func (s *Server) SetEvents(fn func(ctx context.Context, topic, key string, payload []byte) error) {
@@ -54,9 +74,9 @@ func (s *Server) Router() *gin.Engine {
 }
 
 func (s *Server) Deliver(ctx context.Context, env eventx.Envelope) error {
-	if ok, err := s.state.Once(ctx, env.ID, 24*time.Hour); err != nil {
+	if seen, err := s.state.Seen(ctx, env.ID); err != nil {
 		s.warn("dedup", err)
-	} else if !ok {
+	} else if seen {
 		return nil
 	}
 	raw, err := env.Bytes()
@@ -79,8 +99,20 @@ func (s *Server) Deliver(ctx context.Context, env eventx.Envelope) error {
 		return users
 	})
 	body, _ := json.Marshal(map[string]any{"type": "event", "event_type": env.Type, "payload": json.RawMessage(raw)})
+	var firstErr error
 	for _, userID := range ids {
-		_ = s.publish(ctx, userID, body)
+		if err := s.publish(ctx, userID, body); err != nil {
+			s.warn("publish", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if _, err := s.state.Once(ctx, env.ID, 24*time.Hour); err != nil {
+		s.warn("dedup", err)
 	}
 	return nil
 }
@@ -111,21 +143,62 @@ func (s *socket) Send(payload []byte) bool {
 	}
 }
 
-func (s *Server) ws(c *gin.Context) {
-	raw := strings.TrimPrefix(c.Query("token"), "Bearer ")
-	if header := c.GetHeader("Authorization"); raw == "" {
-		raw = strings.TrimPrefix(header, "Bearer ")
+func (s *socket) Close() { _ = s.conn.CloseNow() }
+
+type connState struct {
+	token     string
+	userID    string
+	connID    string
+	guilds    map[string]struct{}
+	dms       map[string]struct{}
+	subGuilds []string
+	subDMs    []string
+	channels  map[string]string
+	friends   map[string]struct{}
+	friendIDs []string
+}
+
+func tokenFromRequest(r *http.Request) string {
+	for _, line := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, p := range strings.Split(line, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" && p != wsProtocol {
+				return p
+			}
+		}
 	}
+	if q := r.URL.Query().Get("token"); q != "" {
+		return strings.TrimPrefix(q, "Bearer ")
+	}
+	return strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+}
+
+func (s *Server) ws(c *gin.Context) {
+	raw := tokenFromRequest(c.Request)
 	idnty, err := s.tokens.Parse(raw)
 	if err != nil {
 		c.Status(http.StatusUnauthorized)
 		return
 	}
-	conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
+		OriginPatterns: s.origins,
+		Subprotocols:   []string{wsProtocol},
+	})
 	if err != nil {
 		return
 	}
 	sock := &socket{userID: id.Format(idnty.UserID), connID: strconv.FormatInt(time.Now().UnixNano(), 10), conn: conn, send: make(chan []byte, 32)}
+	st := &connState{
+		token: raw, userID: sock.userID, connID: sock.connID,
+		guilds: map[string]struct{}{}, dms: map[string]struct{}{},
+		channels: map[string]string{}, friends: map[string]struct{}{},
+	}
+	if !idnty.ExpiresAt.IsZero() {
+		timer := time.AfterFunc(time.Until(idnty.ExpiresAt), func() {
+			_ = conn.Close(websocket.StatusPolicyViolation, "token expired")
+		})
+		defer timer.Stop()
+	}
 	s.hub.Add(sock)
 	s.track(sock.userID, 1)
 	ctx := c.Request.Context()
@@ -137,11 +210,13 @@ func (s *Server) ws(c *gin.Context) {
 			s.warn("presence", err)
 		}
 	}()
-	s.notifyFriends(ctx, raw, sock.userID, "online")
-	defer s.notifyFriends(context.Background(), raw, sock.userID, "offline")
+	s.loadFriends(ctx, st)
+	s.notifyFriends(ctx, st.friendIDs, sock.userID, "online")
+	defer s.notifyFriends(context.Background(), st.friendIDs, sock.userID, "offline")
 
-	var subs struct{ guilds, dms []string }
-	defer func() { _ = s.state.Unsubscribe(context.Background(), sock.userID, subs.guilds, subs.dms) }()
+	defer func() {
+		_ = s.state.Unsubscribe(context.Background(), sock.userID, sock.connID, st.subGuilds, st.subDMs)
+	}()
 
 	go func() {
 		for payload := range sock.send {
@@ -166,40 +241,187 @@ func (s *Server) ws(c *gin.Context) {
 		}
 		switch msg.Type {
 		case "heartbeat":
-			if err := s.state.Touch(ctx, sock.userID, sock.connID, subs.guilds, subs.dms, 45*time.Second); err != nil {
+			if err := s.state.Touch(ctx, sock.userID, sock.connID, st.subGuilds, st.subDMs, 45*time.Second); err != nil {
 				s.warn("heartbeat", err)
 			}
 			_ = writeJSON(ctx, conn, map[string]string{"type": "heartbeat_ack"})
 		case "subscribe":
-			if err := s.state.Unsubscribe(ctx, sock.userID, subs.guilds, subs.dms); err != nil {
+			if err := s.state.Unsubscribe(ctx, sock.userID, sock.connID, st.subGuilds, st.subDMs); err != nil {
 				s.warn("unsubscribe", err)
 			}
-			subs.guilds, subs.dms = msg.GuildIDs, msg.DMIDs
-			if err := s.state.Touch(ctx, sock.userID, sock.connID, subs.guilds, subs.dms, 45*time.Second); err != nil {
+			st.subGuilds, st.subDMs = s.authorizeSubscriptions(ctx, st, msg.GuildIDs, msg.DMIDs)
+			if err := s.state.Touch(ctx, sock.userID, sock.connID, st.subGuilds, st.subDMs, 45*time.Second); err != nil {
 				s.warn("subscribe", err)
 			}
 		case "typing":
-			s.broadcastTyping(ctx, sock.userID, msg.ChannelID, msg.GuildID)
+			if s.typingAllowed(ctx, st, msg.ChannelID, msg.GuildID) {
+				s.broadcastTyping(ctx, sock.userID, msg.ChannelID, msg.GuildID)
+			}
 		case "call_decline":
-			s.declineCall(ctx, sock.userID, msg.ChannelID)
+			s.declineCall(ctx, st, msg.ChannelID)
 		case "presence_query":
-			online, _ := s.state.Online(ctx, msg.UserIDs)
+			ids := make([]string, 0, len(msg.UserIDs))
+			for _, uid := range msg.UserIDs {
+				if len(ids) >= maxPresenceIDs {
+					break
+				}
+				if _, ok := st.friends[uid]; ok || uid == sock.userID {
+					ids = append(ids, uid)
+				}
+			}
+			online, _ := s.state.Online(ctx, ids)
 			_ = writeJSON(ctx, conn, map[string]any{"type": "presence_snapshot", "online": online})
 		}
 	}
 }
 
-func (s *Server) notifyFriends(ctx context.Context, token, userID, status string) {
+func capUnique(in []string, limit int) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		if len(out) >= limit {
+			break
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+func (s *Server) authorizeSubscriptions(ctx context.Context, st *connState, guildIDs, dmIDs []string) ([]string, []string) {
+	guildIDs = capUnique(guildIDs, maxSubscribe)
+	dmIDs = capUnique(dmIDs, maxSubscribe)
+	st.guilds = map[string]struct{}{}
+	st.dms = map[string]struct{}{}
+	var guilds, dms []string
+	if len(guildIDs) > 0 && s.guilds != nil {
+		gctx, cancel := context.WithTimeout(grpcx.WithToken(ctx, st.token), grpcTimeout)
+		resp, err := s.guilds.ListMyGuilds(gctx, &guildv1.Empty{})
+		cancel()
+		if err != nil {
+			s.warn("list my guilds", err)
+		} else {
+			member := make(map[string]struct{}, len(resp.GetGuilds()))
+			for _, g := range resp.GetGuilds() {
+				member[g.GetId()] = struct{}{}
+			}
+			for _, gid := range guildIDs {
+				if _, ok := member[gid]; ok {
+					guilds = append(guilds, gid)
+					st.guilds[gid] = struct{}{}
+				}
+			}
+		}
+	}
+	if len(dmIDs) > 0 && s.messages != nil {
+		allowed := make([]bool, len(dmIDs))
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 8)
+		for i, dmID := range dmIDs {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int, dmID string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				allowed[i] = s.dmAllowed(ctx, st.token, dmID, nil)
+			}(i, dmID)
+		}
+		wg.Wait()
+		for i, dmID := range dmIDs {
+			if allowed[i] {
+				dms = append(dms, dmID)
+				st.dms[dmID] = struct{}{}
+			}
+		}
+	}
+	return guilds, dms
+}
+
+func (s *Server) dmAllowed(ctx context.Context, token, dmID string, members *[]string) bool {
+	if s.messages == nil {
+		return false
+	}
+	cctx, cancel := context.WithTimeout(grpcx.WithToken(ctx, token), grpcTimeout)
+	defer cancel()
+	resp, err := s.messages.CheckDMAccess(cctx, &messagev1.CheckDMAccessRequest{ChannelId: dmID})
+	if err != nil {
+		s.warn("check dm access", err)
+		return false
+	}
+	if !resp.GetAllowed() {
+		return false
+	}
+	if members != nil {
+		*members = resp.GetMemberIds()
+	}
+	return true
+}
+
+func (s *Server) typingAllowed(ctx context.Context, st *connState, channelID, guildID string) bool {
+	if channelID == "" {
+		return false
+	}
+	if guildID == "" {
+		_, ok := st.dms[channelID]
+		return ok
+	}
+	if _, ok := st.guilds[guildID]; !ok {
+		return false
+	}
+	if g, ok := st.channels[channelID]; ok {
+		return g == guildID
+	}
+	if s.guilds == nil {
+		return false
+	}
+	cctx, cancel := context.WithTimeout(grpcx.WithToken(ctx, st.token), grpcTimeout)
+	defer cancel()
+	resp, err := s.guilds.CheckChannelAccess(cctx, &guildv1.CheckChannelAccessRequest{ChannelId: channelID})
+	if err != nil {
+		s.warn("check channel access", err)
+		return false
+	}
+	if !resp.GetAllowed() || resp.GetGuildId() != guildID {
+		return false
+	}
+	if len(st.channels) < 1000 {
+		st.channels[channelID] = guildID
+	}
+	return true
+}
+
+func (s *Server) loadFriends(ctx context.Context, st *connState) {
 	if s.users == nil {
 		return
 	}
-	resp, err := s.users.ListFriendIDs(grpcx.WithToken(ctx, token), &userv1.ListRequest{})
+	cctx, cancel := context.WithTimeout(grpcx.WithToken(ctx, st.token), grpcTimeout)
+	defer cancel()
+	resp, err := s.users.ListFriendIDs(cctx, &userv1.ListRequest{})
 	if err != nil {
+		s.warn("list friends", err)
+		return
+	}
+	st.friendIDs = resp.GetIds()
+	for _, fid := range st.friendIDs {
+		st.friends[fid] = struct{}{}
+	}
+}
+
+func (s *Server) notifyFriends(ctx context.Context, friendIDs []string, userID, status string) {
+	if len(friendIDs) == 0 {
 		return
 	}
 	body, _ := json.Marshal(map[string]string{"type": "presence", "user_id": userID, "status": status})
-	for _, friendID := range resp.GetIds() {
-		_ = s.publish(ctx, friendID, body)
+	for _, friendID := range friendIDs {
+		if err := s.publish(ctx, friendID, body); err != nil {
+			s.warn("presence publish", err)
+		}
 	}
 }
 
@@ -232,20 +454,17 @@ func (s *Server) broadcastTyping(ctx context.Context, userID, channelID, guildID
 	}
 }
 
-func (s *Server) declineCall(ctx context.Context, userID, channelID string) {
+func (s *Server) declineCall(ctx context.Context, st *connState, channelID string) {
 	if channelID == "" {
 		return
 	}
-	targets, err := s.state.DMUsers(ctx, channelID)
-	if err != nil {
-		s.warn("decline targets", err)
+	var members []string
+	if !s.dmAllowed(ctx, st.token, channelID, &members) {
 		return
 	}
-	if !contains(targets, userID) {
-		return
-	}
+	userID := st.userID
 	body, _ := json.Marshal(map[string]string{"type": "call_declined", "channel_id": channelID, "user_id": userID})
-	for _, id := range targets {
+	for _, id := range members {
 		if id != userID {
 			if err := s.publish(ctx, id, body); err != nil && s.log != nil {
 				s.log("decline publish", err)
@@ -269,15 +488,6 @@ func (s *Server) declineCall(ctx context.Context, userID, channelID string) {
 	}
 }
 
-func contains(items []string, v string) bool {
-	for _, item := range items {
-		if item == v {
-			return true
-		}
-	}
-	return false
-}
-
 func writeJSON(ctx context.Context, conn *websocket.Conn, v any) error {
 	raw, err := json.Marshal(v)
 	if err != nil {
@@ -286,11 +496,23 @@ func writeJSON(ctx context.Context, conn *websocket.Conn, v any) error {
 	return conn.Write(ctx, websocket.MessageText, raw)
 }
 
-func (s *Server) ListenRedis(ctx context.Context) {
+func (s *Server) InitPubSub(ctx context.Context) {
 	pubsub := s.state.Client().Subscribe(ctx, "rt:ctl")
 	s.subMu.Lock()
 	s.ps = pubsub
 	s.subMu.Unlock()
+}
+
+func (s *Server) ListenRedis(ctx context.Context) {
+	s.subMu.Lock()
+	pubsub := s.ps
+	s.subMu.Unlock()
+	if pubsub == nil {
+		s.InitPubSub(ctx)
+		s.subMu.Lock()
+		pubsub = s.ps
+		s.subMu.Unlock()
+	}
 	defer pubsub.Close()
 	for {
 		msg, err := pubsub.ReceiveMessage(ctx)

@@ -20,8 +20,10 @@ func TestTwoPeersExchangeMedia(t *testing.T) {
 		inbox[userID] = append(inbox[userID], append([]byte(nil), payload...))
 		mu.Unlock()
 	}
-	require.NoError(t, room.Join("a", send))
-	require.NoError(t, room.Join("b", send))
+	sessA, err := room.Join("a", send)
+	require.NoError(t, err)
+	sessB, err := room.Join("b", send)
+	require.NoError(t, err)
 	require.ElementsMatch(t, []string{"a", "b"}, room.Peers())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -58,10 +60,10 @@ func TestTwoPeersExchangeMedia(t *testing.T) {
 			b := room.peers["b"]
 			room.mu.Unlock()
 			require.True(t, hasActiveSender(b))
-			room.Leave("a")
+			room.Leave(sessA)
 			require.False(t, hasActiveSender(b))
 			require.Equal(t, []string{"b"}, room.Peers())
-			room.Leave("b")
+			room.Leave(sessB)
 			return
 		case <-time.After(40 * time.Millisecond):
 		}

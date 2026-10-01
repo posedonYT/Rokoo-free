@@ -2,6 +2,8 @@ package sfu
 
 import (
 	"context"
+	"errors"
+	"os"
 	"sync"
 	"time"
 
@@ -11,12 +13,14 @@ import (
 )
 
 type simulcastSource struct {
-	id     string
-	from   string
-	layers map[Layer]*webrtc.TrackRemote
-	outs   map[string]*subForwarder
-	paused map[string]bool
-	mu     sync.Mutex
+	id       string
+	from     string
+	layers   map[Layer]*webrtc.TrackRemote
+	outs     map[string]*subForwarder
+	paused   map[string]bool
+	pliAt    map[Layer]time.Time
+	mu       sync.Mutex
+	codec    webrtc.RTPCodecCapability
 }
 
 type subForwarder struct {
@@ -46,11 +50,16 @@ func (r *Room) attachSimulcast(from string, publisher *peer, track *webrtc.Track
 			layers: map[Layer]*webrtc.TrackRemote{},
 			outs:   map[string]*subForwarder{},
 			paused: map[string]bool{},
+			pliAt:  map[Layer]time.Time{},
+			codec:  track.Codec().RTPCodecCapability,
 		}
 		r.sources[key] = src
 	}
 	src.mu.Lock()
 	src.layers[layer] = track
+	if src.codec.MimeType == "" {
+		src.codec = track.Codec().RTPCodecCapability
+	}
 	var targets []*peer
 	for id, p := range r.peers {
 		if id != from {
@@ -71,7 +80,11 @@ func (r *Room) ensureForwarder(p *peer, src *simulcastSource) {
 		src.mu.Unlock()
 		return
 	}
-	local, err := webrtc.NewTrackLocalStaticRTP(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}, src.id, src.id)
+	codec := src.codec
+	if codec.MimeType == "" {
+		codec = webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}
+	}
+	local, err := webrtc.NewTrackLocalStaticRTP(codec, src.id, src.id)
 	if err != nil {
 		src.mu.Unlock()
 		r.report("simulcast track", err)
@@ -84,11 +97,6 @@ func (r *Room) ensureForwarder(p *peer, src *simulcastSource) {
 		r.report("simulcast add", err)
 		return
 	}
-	r.mu.Lock()
-	if pub := r.peers[p.userID]; pub != nil {
-		pub.published = append(pub.published, local)
-	}
-	r.mu.Unlock()
 	if err := p.negotiate(); err != nil {
 		r.report("simulcast negotiate", err)
 	}
@@ -106,7 +114,10 @@ func (r *Room) readLayer(ctx context.Context, src *simulcastSource, layer Layer,
 			if ctx.Err() != nil {
 				return
 			}
-			continue
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				continue
+			}
+			return
 		}
 		r.bytesIn.Add(uint64(n))
 		pkt := &rtp.Packet{}
@@ -153,24 +164,31 @@ func (r *Room) preferSpeaker(userID string) {
 }
 
 func (r *Room) fanout(src *simulcastSource, layer Layer, pkt *rtp.Packet, key bool) {
+	r.mu.Lock()
+	bwes := make(map[string]int, len(r.peers))
+	pub := r.peers[src.from]
+	for id, p := range r.peers {
+		p.mu.Lock()
+		bwes[id] = p.bwe
+		p.mu.Unlock()
+	}
+	r.mu.Unlock()
+
 	src.mu.Lock()
 	defer src.mu.Unlock()
+	track := src.layers[layer]
+	available := make([]Layer, 0, len(src.layers))
+	for l := range src.layers {
+		available = append(available, l)
+	}
+	var pliRequests []Layer
 	for id, fwd := range src.outs {
 		if src.paused[id] || fwd.paused {
 			continue
 		}
-		r.mu.Lock()
-		p := r.peers[id]
-		r.mu.Unlock()
-		bwe := 1_500_000
-		if p != nil {
-			p.mu.Lock()
-			bwe = p.bwe
-			p.mu.Unlock()
-		}
-		available := make([]Layer, 0, len(src.layers))
-		for l := range src.layers {
-			available = append(available, l)
+		bwe := bwes[id]
+		if bwe == 0 {
+			bwe = 1_500_000
 		}
 		want := Choose(bwe, fwd.preferred, available)
 		if want == LayerNone || want != layer {
@@ -178,7 +196,7 @@ func (r *Room) fanout(src *simulcastSource, layer Layer, pkt *rtp.Packet, key bo
 		}
 		switched := fwd.current != want
 		if switched && !key {
-			r.requestPLI(src, layer)
+			pliRequests = append(pliRequests, layer)
 			continue
 		}
 		if switched {
@@ -196,17 +214,18 @@ func (r *Room) fanout(src *simulcastSource, layer Layer, pkt *rtp.Packet, key bo
 		}
 		r.bytesOut.Add(uint64(len(raw)))
 	}
+	if len(pliRequests) > 0 && pub != nil && track != nil {
+		r.requestPLILocked(src, pub, track, layer)
+	}
 }
 
-func (r *Room) requestPLI(src *simulcastSource, layer Layer) {
-	r.pli.Add(1)
-	r.mu.Lock()
-	pub := r.peers[src.from]
-	track := src.layers[layer]
-	r.mu.Unlock()
-	if pub == nil || track == nil {
+func (r *Room) requestPLILocked(src *simulcastSource, pub *peer, track *webrtc.TrackRemote, layer Layer) {
+	now := time.Now()
+	if last, ok := src.pliAt[layer]; ok && now.Sub(last) < 500*time.Millisecond {
 		return
 	}
+	src.pliAt[layer] = now
+	r.pli.Add(1)
 	_ = pub.pc.WriteRTCP([]rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())}})
 }
 

@@ -67,11 +67,24 @@ func (m *memRefresh) Delete(_ context.Context, hash string) error {
 	return nil
 }
 
-type memLimit struct{ n, max int }
+type memLimit struct {
+	max    int
+	counts map[string]int
+}
 
-func (m *memLimit) Allow(context.Context, string) (bool, error) {
-	m.n++
-	return m.n <= m.max, nil
+func (m *memLimit) Allow(_ context.Context, key string) (bool, error) {
+	if m.counts == nil {
+		m.counts = map[string]int{}
+	}
+	m.counts[key]++
+	return m.counts[key] <= m.max, nil
+}
+
+func (m *memLimit) Reset(_ context.Context, keys ...string) error {
+	for _, k := range keys {
+		delete(m.counts, k)
+	}
+	return nil
 }
 
 type ensured struct{ calls int }
@@ -135,23 +148,84 @@ func TestRegisterLoginRefreshLogout(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestLoginRateLimit(t *testing.T) {
+func TestLoginRateLimitCountsOnlyFailures(t *testing.T) {
 	store := &memStore{byEmail: map[string]domain.Account{}}
 	refresh := &memRefresh{items: map[string]struct {
 		id   int64
 		name string
 	}{}}
-	svc := New(store, refresh, newTokens(t), id.New(1), &memLimit{max: 2}, nil, time.Hour)
-	_, err := svc.Register(context.Background(), RegisterInput{Email: "a@b.co", Username: "abc", Password: "supersecret"})
+	lim := &memLimit{max: 2}
+	svc := New(store, refresh, newTokens(t), id.New(1), lim, nil, time.Hour)
+	ctx := context.Background()
+	_, err := svc.Register(ctx, RegisterInput{Email: "a@b.co", Username: "abc", Password: "supersecret", IP: "10.0.0.1"})
 	require.NoError(t, err)
-	_, err = svc.Login(context.Background(), LoginInput{Email: "a@b.co", Password: "supersecret"})
-	require.NoError(t, err)
-	_, err = svc.Login(context.Background(), LoginInput{Email: "a@b.co", Password: "supersecret"})
-	require.NoError(t, err)
-	_, err = svc.Login(context.Background(), LoginInput{Email: "a@b.co", Password: "supersecret"})
+
+	// successful logins never accumulate
+	for i := 0; i < 5; i++ {
+		_, err = svc.Login(ctx, LoginInput{Email: "a@b.co", Password: "supersecret", IP: "10.0.0.1"})
+		require.NoError(t, err)
+	}
+	require.Empty(t, lim.counts["login:ip:10.0.0.1"])
+	require.Empty(t, lim.counts["login:a@b.co:10.0.0.1"])
+
+	// failed attempts accumulate, then block even the correct password
+	for i := 0; i < 2; i++ {
+		_, err = svc.Login(ctx, LoginInput{Email: "a@b.co", Password: "wrong-pass", IP: "10.0.0.1"})
+		require.Error(t, err)
+	}
+	require.Equal(t, 2, lim.counts["login:ip:10.0.0.1"])
+	require.Equal(t, 2, lim.counts["login:a@b.co:10.0.0.1"])
+	_, err = svc.Login(ctx, LoginInput{Email: "a@b.co", Password: "supersecret", IP: "10.0.0.1"})
 	var app *apperr.Error
 	require.ErrorAs(t, err, &app)
 	require.Equal(t, apperr.CodeRateLimit, app.Code)
+
+	// another IP is not affected by the per-email:ip key
+	_, err = svc.Login(ctx, LoginInput{Email: "a@b.co", Password: "supersecret", IP: "10.0.0.2"})
+	require.NoError(t, err)
+}
+
+func TestLoginSuccessResetsFailures(t *testing.T) {
+	store := &memStore{byEmail: map[string]domain.Account{}}
+	refresh := &memRefresh{items: map[string]struct {
+		id   int64
+		name string
+	}{}}
+	lim := &memLimit{max: 3}
+	svc := New(store, refresh, newTokens(t), id.New(1), lim, nil, time.Hour)
+	ctx := context.Background()
+	_, err := svc.Register(ctx, RegisterInput{Email: "a@b.co", Username: "abc", Password: "supersecret", IP: "10.0.0.1"})
+	require.NoError(t, err)
+	_, err = svc.Login(ctx, LoginInput{Email: "a@b.co", Password: "wrong-pass", IP: "10.0.0.1"})
+	require.Error(t, err)
+	require.Equal(t, 1, lim.counts["login:ip:10.0.0.1"])
+	_, err = svc.Login(ctx, LoginInput{Email: "a@b.co", Password: "supersecret", IP: "10.0.0.1"})
+	require.NoError(t, err)
+	require.Empty(t, lim.counts["login:ip:10.0.0.1"])
+	require.Empty(t, lim.counts["login:a@b.co:10.0.0.1"])
+}
+
+func TestRegisterRateLimitByIP(t *testing.T) {
+	store := &memStore{byEmail: map[string]domain.Account{}}
+	refresh := &memRefresh{items: map[string]struct {
+		id   int64
+		name string
+	}{}}
+	lim := &memLimit{max: 2}
+	svc := New(store, refresh, newTokens(t), id.New(1), lim, nil, time.Hour)
+	ctx := context.Background()
+	for i, email := range []string{"a@b.co", "b@b.co"} {
+		_, err := svc.Register(ctx, RegisterInput{Email: email, Username: "user" + string(rune('a'+i)), Password: "supersecret", IP: "10.0.0.1"})
+		require.NoError(t, err)
+	}
+	_, err := svc.Register(ctx, RegisterInput{Email: "c@b.co", Username: "userc", Password: "supersecret", IP: "10.0.0.1"})
+	var app *apperr.Error
+	require.ErrorAs(t, err, &app)
+	require.Equal(t, apperr.CodeRateLimit, app.Code)
+	require.Equal(t, 3, lim.counts["register:ip:10.0.0.1"])
+
+	_, err = svc.Register(ctx, RegisterInput{Email: "c@b.co", Username: "userc", Password: "supersecret", IP: "10.0.0.2"})
+	require.NoError(t, err)
 }
 
 func TestRegisterValidation(t *testing.T) {

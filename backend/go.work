@@ -10,4 +10,5 @@ use (
 	./services/realtime
 	./services/user
 	./services/voice
+	./tools/smoke
 )

@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"sync"
 
@@ -67,16 +68,36 @@ func (m *Memory) GetProfile(_ context.Context, id int64) (domain.Profile, error)
 func (m *Memory) Search(_ context.Context, query string, limit int) ([]domain.Profile, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	q := strings.ToLower(query)
+	q := strings.ToLower(strings.TrimSpace(query))
+	name, disc, hasTag := parseTag(q)
+	exact := hasTag && name != "" && disc != ""
+	prefix := q
+	if hasTag {
+		prefix = name
+	}
+	if !exact && prefix == "" {
+		return nil, nil
+	}
 	var out []domain.Profile
 	for _, p := range m.users {
-		tag := p.Username + "#" + p.Discriminator
-		if strings.HasPrefix(p.Username, q) || tag == q {
-			out = append(out, p)
-			if len(out) >= limit {
-				break
+		uname := strings.ToLower(p.Username)
+		if exact {
+			if uname != name || p.Discriminator != disc {
+				continue
 			}
+		} else if !strings.HasPrefix(uname, prefix) {
+			continue
 		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Username != out[j].Username {
+			return out[i].Username < out[j].Username
+		}
+		return out[i].Discriminator < out[j].Discriminator
+	})
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out, nil
 }

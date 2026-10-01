@@ -61,10 +61,30 @@ func (p *Postgres) UpdateGuild(ctx context.Context, g domain.Guild) error {
 
 func (p *Postgres) DeleteGuild(ctx context.Context, guildID int64) error {
 	return p.inTx(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT id FROM channels WHERE guild_id=$1 ORDER BY id`, guildID)
+		if err != nil {
+			return err
+		}
+		channelIDs := []string{}
+		for rows.Next() {
+			var chID int64
+			if err := rows.Scan(&chID); err != nil {
+				rows.Close()
+				return err
+			}
+			channelIDs = append(channelIDs, id.Format(chID))
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `DELETE FROM guilds WHERE id=$1`, guildID); err != nil {
 			return err
 		}
-		return p.emit(ctx, tx, "guild.deleted", guildID, map[string]string{"guild_id": id.Format(guildID)})
+		return p.emit(ctx, tx, "guild.deleted", guildID, map[string]any{
+			"guild_id":    id.Format(guildID),
+			"channel_ids": channelIDs,
+		})
 	})
 }
 
@@ -324,7 +344,7 @@ func (p *Postgres) inTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	return tx.Commit(ctx)
 }
 
-func (p *Postgres) emit(ctx context.Context, tx pgx.Tx, typ string, guildID int64, payload map[string]string) error {
+func (p *Postgres) emit(ctx context.Context, tx pgx.Tx, typ string, guildID int64, payload any) error {
 	eventID := p.ids.Next()
 	env, err := eventx.New(id.Format(eventID), typ, payload)
 	if err != nil {

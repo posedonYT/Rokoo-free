@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 	"rokko.dev/pkg/authn"
 	"rokko.dev/pkg/eventx"
 	"rokko.dev/pkg/id"
@@ -49,35 +50,25 @@ type Options struct {
 	TURNSecret         string
 	TURNTTl            time.Duration
 	RingTimeout        time.Duration
+	Origins            []string
 	Ready              func(context.Context) error
 }
 
 type Server struct {
-	opts     Options
-	mu       sync.Mutex
-	rooms    map[string]*sfu.Room
-	conns    map[string]context.CancelFunc
-	draining atomic.Bool
-	writeQ   atomic.Int64
-	signals  *signalLimit
-	metrics  *metrics
+	opts      Options
+	mu        sync.Mutex
+	rooms     map[string]*sfu.Room
+	conns     map[string]context.CancelFunc
+	draining  atomic.Bool
+	writeQ    atomic.Int64
+	metrics   *metrics
+	pubCh     chan pubJob
+	joinLimit *rate.Limiter
 }
 
-type signalLimit struct {
-	mu     sync.Mutex
-	window time.Time
-	n      int
-}
-
-func (l *signalLimit) allow(now time.Time) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if now.Sub(l.window) >= time.Second {
-		l.window = now
-		l.n = 0
-	}
-	l.n++
-	return l.n <= 40
+type pubJob struct {
+	topic, key string
+	payload    []byte
 }
 
 func New(opts Options) *Server {
@@ -99,13 +90,32 @@ func New(opts Options) *Server {
 	if opts.Log == nil {
 		opts.Log = zap.NewNop()
 	}
+	if len(opts.Origins) == 0 {
+		opts.Origins = []string{"localhost:*", "127.0.0.1:*"}
+	}
 	reg := prometheus.NewRegistry()
-	return &Server{
-		opts:    opts,
-		rooms:   map[string]*sfu.Room{},
-		conns:   map[string]context.CancelFunc{},
-		signals: &signalLimit{},
-		metrics: newMetrics(reg),
+	s := &Server{
+		opts:      opts,
+		rooms:     map[string]*sfu.Room{},
+		conns:     map[string]context.CancelFunc{},
+		metrics:   newMetrics(reg),
+		pubCh:     make(chan pubJob, 256),
+		joinLimit: rate.NewLimiter(rate.Every(100*time.Millisecond), 5),
+	}
+	go s.publishLoop()
+	return s
+}
+
+func (s *Server) publishLoop() {
+	for job := range s.pubCh {
+		if s.opts.Pub == nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := s.opts.Pub.Publish(ctx, job.topic, job.key, job.payload); err != nil {
+			s.opts.Log.Warn("publish", zap.Error(err), zap.String("topic", job.topic), zap.String("key", job.key))
+		}
+		cancel()
 	}
 }
 
@@ -139,6 +149,24 @@ func (s *Server) ready(c *gin.Context) {
 	c.Status(http.StatusOK)
 }
 
+func (s *Server) RefreshRooms(ctx context.Context) {
+	if s.opts.Registry == nil {
+		return
+	}
+	s.mu.Lock()
+	rooms := make(map[string]*sfu.Room, len(s.rooms))
+	for id, room := range s.rooms {
+		rooms[id] = room
+	}
+	load := len(s.rooms)
+	s.mu.Unlock()
+	for id, room := range rooms {
+		_ = s.opts.Registry.SetParticipants(ctx, id, room.Peers())
+		_, _ = s.opts.Registry.Refresh(ctx, id, s.opts.NodeID)
+	}
+	_ = s.opts.Registry.UpsertNode(ctx, registry.Node{ID: s.opts.NodeID, URL: s.opts.PublicURL, Load: load, Draining: s.draining.Load()})
+}
+
 func (s *Server) Drain(ctx context.Context) {
 	s.draining.Store(true)
 	if s.opts.Registry != nil {
@@ -162,7 +190,7 @@ func (s *Server) Drain(ctx context.Context) {
 			_ = s.opts.Registry.Release(context.Background(), id, s.opts.NodeID)
 		}
 		for _, peer := range room.Peers() {
-			room.Leave(peer)
+			room.ForceLeave(peer)
 		}
 		delete(s.rooms, id)
 	}
@@ -291,13 +319,20 @@ type joinMessage struct {
 }
 
 func (s *Server) ws(c *gin.Context) {
-	raw := bearer(c)
+	raw := tokenFromRequest(c.Request)
 	idnty, err := s.opts.Tokens.Parse(raw)
 	if err != nil {
 		c.Status(http.StatusUnauthorized)
 		return
 	}
-	conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{InsecureSkipVerify: true})
+	if !s.joinLimit.Allow() {
+		c.Status(http.StatusTooManyRequests)
+		return
+	}
+	conn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
+		OriginPatterns: s.opts.Origins,
+		Subprotocols:   []string{"rokko.v1"},
+	})
 	if err != nil {
 		return
 	}
@@ -343,7 +378,6 @@ func (s *Server) ws(c *gin.Context) {
 	}
 	ice := turn.ICEServers(s.opts.STUN, s.opts.TURNURL, s.opts.TURNSecret, s.opts.TURNTTl, time.Now())
 	_ = writer.Send(mustJSON(map[string]any{"type": "config", "ice_servers": ice}))
-	room := s.room(key)
 	send := func(_ string, payload []byte) {
 		if !writer.Send(payload) {
 			s.opts.Log.Warn("ws queue full", zap.String("user", userID), zap.String("room", key), zap.String("node", s.opts.NodeID))
@@ -351,17 +385,14 @@ func (s *Server) ws(c *gin.Context) {
 		}
 		s.writeQ.Store(int64(writer.Depth()))
 	}
-	first := len(room.Peers()) == 0
-	if err := room.Join(userID, send); err != nil {
+	room, sess, first, err := s.joinRoom(key, userID, send)
+	if err != nil {
 		if sfu.IsRoomFull(err) {
 			_ = writer.Send(mustJSON(map[string]string{"type": "error", "error": "room_full"}))
 		}
 		return
 	}
 	s.mu.Lock()
-	if s.rooms[key] != room {
-		s.rooms[key] = room
-	}
 	connCtx, connCancel := context.WithCancel(context.Background())
 	s.conns[key+"|"+userID] = connCancel
 	s.mu.Unlock()
@@ -370,32 +401,78 @@ func (s *Server) ws(c *gin.Context) {
 		s.mu.Lock()
 		delete(s.conns, key+"|"+userID)
 		s.mu.Unlock()
-		empty := room.Leave(userID)
+		empty := room.Leave(sess)
 		if empty {
 			s.dropIfEmpty(key, room)
 		}
-		s.publishState(context.Background(), userID, join, guildID, members, s.participantIDs(context.Background(), key), "left")
 		s.syncParticipants(context.Background(), key, room)
+		s.publishState(context.Background(), userID, join, guildID, members, s.participantIDs(context.Background(), key), "left")
 	}()
-	s.publishState(ctx, userID, join, guildID, members, room.Peers(), "joined")
 	s.syncParticipants(ctx, key, room)
+	s.publishState(ctx, userID, join, guildID, members, room.Peers(), "joined")
 	if first && join.Kind == "dm" {
 		s.ring(ctx, userID, join, members)
 		go s.watchRing(room, key, userID, join, members)
 	}
 	go s.keepalive(connCtx, conn)
+	if !idnty.ExpiresAt.IsZero() {
+		go s.closeOnExpiry(connCtx, conn, idnty.ExpiresAt)
+	}
+	signalLimit := rate.NewLimiter(40, 40)
 	s.opts.Log.Info("joined", zap.String("room", key), zap.String("user", userID), zap.String("node", s.opts.NodeID))
 	for {
 		_, payload, err := conn.Read(ctx)
 		if err != nil {
 			return
 		}
-		if !s.signals.allow(time.Now()) {
-			continue
+		if !signalLimit.Allow() {
+			_ = conn.Close(websocket.StatusPolicyViolation, "rate limit")
+			return
 		}
 		if err := room.Signal(userID, payload); err != nil {
 			s.opts.Log.Warn("signal", zap.Error(err), zap.String("room", key), zap.String("user", userID))
 		}
+	}
+}
+
+func (s *Server) joinRoom(key, userID string, send sfu.Signal) (*sfu.Room, *sfu.Session, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	room := s.rooms[key]
+	created := false
+	if room == nil {
+		room = sfu.NewRoom(key, s.opts.API, s.opts.ICE)
+		room.SetLimits(s.opts.MaxParticipants, s.opts.MaxVideoPublishers)
+		room.OnError(func(msg string, err error) {
+			s.opts.Log.Warn(msg, zap.Error(err), zap.String("room", key), zap.String("node", s.opts.NodeID))
+		})
+		s.rooms[key] = room
+		created = true
+	}
+	first := room.Empty()
+	sess, err := room.Join(userID, send)
+	if err != nil {
+		if created && room.Empty() {
+			delete(s.rooms, key)
+		}
+		return nil, nil, false, err
+	}
+	return room, sess, first, nil
+}
+
+func (s *Server) closeOnExpiry(ctx context.Context, conn *websocket.Conn, exp time.Time) {
+	d := time.Until(exp)
+	if d <= 0 {
+		_ = conn.Close(websocket.StatusPolicyViolation, "token expired")
+		return
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-t.C:
+		_ = conn.Close(websocket.StatusPolicyViolation, "token expired")
 	}
 }
 
@@ -411,6 +488,7 @@ func (s *Server) keepalive(ctx context.Context, conn *websocket.Conn) {
 			err := conn.Ping(ping)
 			cancel()
 			if err != nil {
+				_ = conn.Close(websocket.StatusGoingAway, "ping failed")
 				return
 			}
 		}
@@ -430,21 +508,6 @@ func (s *Server) watchRing(room *sfu.Room, key, userID string, join joinMessage,
 	})
 	room.Kick(userID, "ring_timeout")
 	s.dropIfEmpty(key, room)
-}
-
-func (s *Server) room(id string) *sfu.Room {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	room := s.rooms[id]
-	if room == nil {
-		room = sfu.NewRoom(id, s.opts.API, s.opts.ICE)
-		room.SetLimits(s.opts.MaxParticipants, s.opts.MaxVideoPublishers)
-		room.OnError(func(msg string, err error) {
-			s.opts.Log.Warn(msg, zap.Error(err), zap.String("room", id), zap.String("node", s.opts.NodeID))
-		})
-		s.rooms[id] = room
-	}
-	return room
 }
 
 func (s *Server) dropIfEmpty(id string, room *sfu.Room) {
@@ -480,7 +543,10 @@ func (s *Server) syncParticipants(ctx context.Context, room string, current *sfu
 	}
 	_ = s.opts.Registry.SetParticipants(ctx, room, current.Peers())
 	_, _ = s.opts.Registry.Refresh(ctx, room, s.opts.NodeID)
-	_ = s.opts.Registry.UpsertNode(ctx, registry.Node{ID: s.opts.NodeID, URL: s.opts.PublicURL, Load: len(s.rooms)})
+	s.mu.Lock()
+	load := len(s.rooms)
+	s.mu.Unlock()
+	_ = s.opts.Registry.UpsertNode(ctx, registry.Node{ID: s.opts.NodeID, URL: s.opts.PublicURL, Load: load})
 }
 
 func (s *Server) ring(ctx context.Context, userID string, join joinMessage, members []string) {
@@ -535,8 +601,11 @@ func (s *Server) publish(ctx context.Context, typ, roomID, guildID string, recip
 	if err != nil {
 		return
 	}
-	if err := s.opts.Pub.Publish(ctx, "voice.events", roomID, raw); err != nil {
-		s.opts.Log.Warn("publish", zap.Error(err), zap.String("type", typ), zap.String("room", roomID))
+	job := pubJob{topic: "voice.events", key: roomID, payload: raw}
+	select {
+	case s.pubCh <- job:
+	default:
+		s.opts.Log.Warn("publish queue full", zap.String("type", typ), zap.String("room", roomID))
 	}
 }
 
@@ -575,11 +644,22 @@ func (s *Server) Collect() {
 }
 
 func bearer(c *gin.Context) string {
-	raw := strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
-	if raw == "" {
-		raw = c.Query("token")
+	return tokenFromRequest(c.Request)
+}
+
+func tokenFromRequest(r *http.Request) string {
+	for _, line := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, p := range strings.Split(line, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" && p != "rokko.v1" {
+				return p
+			}
+		}
 	}
-	return raw
+	if q := r.URL.Query().Get("token"); q != "" {
+		return strings.TrimPrefix(q, "Bearer ")
+	}
+	return strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 }
 
 func mustJSON(v any) []byte {

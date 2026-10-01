@@ -3,18 +3,23 @@ package sfu
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pion/ice/v4"
 	"github.com/pion/interceptor"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 )
 
 type APIOptions struct {
-	UDPPort int
-	HostIP  string
+	UDPPort    int
+	HostIP     string
+	PublicOnly bool
 }
 
 type Signal func(userID string, payload []byte)
@@ -52,6 +57,18 @@ type Room struct {
 	pli                atomic.Uint64
 }
 
+type Session struct {
+	userID string
+	peer   *peer
+}
+
+func (s *Session) UserID() string {
+	if s == nil {
+		return ""
+	}
+	return s.userID
+}
+
 type peer struct {
 	userID    string
 	pc        *webrtc.PeerConnection
@@ -62,9 +79,18 @@ type peer struct {
 	pending   bool
 	published []*webrtc.TrackLocalStaticRTP
 	bwe       int
+	lastBWE   int
 	speaking  bool
 	videoPubs int
+	audioPubs int
 }
+
+const (
+	maxAudioTracks = 1
+	maxVideoTracks = 2
+	minBWE         = 50_000
+	maxBWE         = 50_000_000
+)
 
 func NewAPI(opts APIOptions) (*webrtc.API, error) {
 	m := &webrtc.MediaEngine{}
@@ -85,6 +111,15 @@ func NewAPI(opts APIOptions) (*webrtc.API, error) {
 	}
 	if opts.HostIP != "" {
 		se.SetNAT1To1IPs([]string{opts.HostIP}, webrtc.ICECandidateTypeHost)
+	}
+	if opts.PublicOnly {
+		se.SetIPFilter(func(ip net.IP) bool {
+			return ip != nil && !ip.IsPrivate() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast()
+		})
+		se.SetNetworkTypes([]webrtc.NetworkType{
+			webrtc.NetworkTypeUDP4,
+			webrtc.NetworkTypeUDP6,
+		})
 	}
 	return webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),
@@ -160,6 +195,12 @@ func (r *Room) Empty() bool {
 	return len(r.peers) == 0
 }
 
+func (r *Room) First() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.peers) == 0
+}
+
 func (r *Room) Stats() RoomStats {
 	r.mu.Lock()
 	peers := len(r.peers)
@@ -201,27 +242,23 @@ type RoomStats struct {
 	BWE           int
 }
 
-func (r *Room) Join(userID string, send Signal) error {
-	r.mu.Lock()
-	if _, exists := r.peers[userID]; !exists && r.maxParticipants > 0 && len(r.peers) >= r.maxParticipants {
-		r.mu.Unlock()
-		return errRoomFull
-	}
-	r.mu.Unlock()
+func (r *Room) Join(userID string, send Signal) (*Session, error) {
 	pc, err := r.api.NewPeerConnection(webrtc.Configuration{ICEServers: r.ice})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
 		_ = pc.Close()
-		return err
+		return nil, err
 	}
 	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
 		_ = pc.Close()
-		return err
+		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	p := &peer{userID: userID, pc: pc, send: send, ctx: ctx, cancel: cancel, bwe: 1_500_000}
+	p := &peer{userID: userID, pc: pc, send: send, ctx: ctx, cancel: cancel, bwe: 1_500_000, lastBWE: 1_500_000}
+	sess := &Session{userID: userID, peer: p}
+
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
 		if c == nil {
 			return
@@ -231,9 +268,20 @@ func (r *Room) Join(userID string, send Signal) error {
 			Candidate: init.Candidate, SDPMid: init.SDPMid, SDPMLineIndex: init.SDPMLineIndex,
 		}})
 	})
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		if state == webrtc.PeerConnectionStateFailed || state == webrtc.PeerConnectionStateClosed {
+			r.Leave(sess)
+		}
+	})
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		if track.RID() != "" && track.Kind() == webrtc.RTPCodecTypeVideo {
 			r.attachSimulcast(userID, p, track)
+			return
+		}
+		if !r.allowTrack(p, track.Kind()) {
+			if track.Kind() == webrtc.RTPCodecTypeVideo {
+				p.write(Message{Type: "error", SDP: "video_limit"})
+			}
 			return
 		}
 		local, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID(), track.StreamID())
@@ -241,17 +289,22 @@ func (r *Room) Join(userID string, send Signal) error {
 			r.report("track", err)
 			return
 		}
-		if track.Kind() == webrtc.RTPCodecTypeVideo && !r.allowVideo(p) {
-			p.write(Message{Type: "error", SDP: "video_limit"})
-			return
-		}
 		r.forward(userID, local)
-		go pump(p.ctx, track, local, &r.bytesIn, &r.bytesOut)
+		go pump(p.ctx, track, local, p, &r.bytesIn, &r.bytesOut, r)
 	})
+
 	r.mu.Lock()
-	if old := r.peers[userID]; old != nil {
-		old.cancel()
-		_ = old.pc.Close()
+	if _, exists := r.peers[userID]; !exists && r.maxParticipants > 0 && len(r.peers) >= r.maxParticipants {
+		r.mu.Unlock()
+		cancel()
+		_ = pc.Close()
+		return nil, errRoomFull
+	}
+	var old *peer
+	if prev := r.peers[userID]; prev != nil {
+		old = prev
+		delete(r.peers, userID)
+		r.dropSourcesLocked(userID)
 	}
 	r.peers[userID] = p
 	others := make([]string, 0, len(r.peers)-1)
@@ -260,34 +313,74 @@ func (r *Room) Join(userID string, send Signal) error {
 			others = append(others, id)
 		}
 	}
+	var stalePublished []*webrtc.TrackLocalStaticRTP
+	if old != nil {
+		stalePublished = append(stalePublished, old.published...)
+	}
+	remaining := make([]*peer, 0, len(r.peers))
+	for _, other := range r.peers {
+		if other != p {
+			remaining = append(remaining, other)
+		}
+	}
 	r.mu.Unlock()
+
+	if old != nil {
+		old.cancel()
+		_ = old.pc.Close()
+		for _, other := range remaining {
+			if other.removeTracks(stalePublished) {
+				if err := other.negotiate(); err != nil {
+					r.report("replace negotiate", err)
+				}
+			}
+		}
+	}
+
 	p.write(Message{Type: "joined", UserID: userID})
 	for _, other := range others {
 		p.write(Message{Type: "peer_joined", UserID: other})
 		r.writeTo(other, Message{Type: "peer_joined", UserID: userID})
 	}
-	return nil
+	return sess, nil
+}
+
+func (r *Room) allowTrack(p *peer, kind webrtc.RTPCodecType) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch kind {
+	case webrtc.RTPCodecTypeAudio:
+		if p.audioPubs >= maxAudioTracks {
+			return false
+		}
+		p.audioPubs++
+		return true
+	case webrtc.RTPCodecTypeVideo:
+		if p.videoPubs >= maxVideoTracks {
+			return false
+		}
+		if p.videoPubs == 0 {
+			if r.maxVideoPublishers > 0 {
+				count := 0
+				for _, other := range r.peers {
+					if other.videoPubs > 0 {
+						count++
+					}
+				}
+				if count >= r.maxVideoPublishers {
+					return false
+				}
+			}
+		}
+		p.videoPubs++
+		return true
+	default:
+		return false
+	}
 }
 
 func (r *Room) allowVideo(p *peer) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if p.videoPubs > 0 {
-		return true
-	}
-	if r.maxVideoPublishers <= 0 {
-		p.videoPubs++
-		return true
-	}
-	count := 0
-	for _, other := range r.peers {
-		count += other.videoPubs
-	}
-	if count >= r.maxVideoPublishers {
-		return false
-	}
-	p.videoPubs++
-	return true
+	return r.allowTrack(p, webrtc.RTPCodecTypeVideo)
 }
 
 func (r *Room) Signal(userID string, raw []byte) error {
@@ -315,6 +408,16 @@ func (r *Room) Signal(userID string, raw []byte) error {
 			return err
 		}
 		p.write(Message{Type: "answer", SDP: answer.SDP})
+		p.mu.Lock()
+		pending := p.pending
+		p.pending = false
+		p.mu.Unlock()
+		if pending {
+			if err := p.negotiate(); err != nil {
+				r.report("negotiate", err)
+				return err
+			}
+		}
 	case "answer":
 		if err := p.pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: msg.SDP}); err != nil {
 			return err
@@ -337,43 +440,105 @@ func (r *Room) Signal(userID string, raw []byte) error {
 			Candidate: msg.Candidate.Candidate, SDPMid: msg.Candidate.SDPMid, SDPMLineIndex: msg.Candidate.SDPMLineIndex,
 		})
 	case "set_layer":
-		r.setPreferred(userID, msg.Track, Layer(msg.Layer))
+		layer := Layer(msg.Layer)
+		if layer != LayerQ && layer != LayerH && layer != LayerF {
+			return nil
+		}
+		if msg.Track == "" {
+			return nil
+		}
+		r.setPreferred(userID, msg.Track, layer)
 	case "pause_video":
+		if msg.Track == "" {
+			return nil
+		}
 		r.pauseSource(userID, msg.Track, msg.Paused)
 	case "bwe":
-		if msg.BWE > 0 {
-			p.mu.Lock()
-			p.bwe = msg.BWE
-			p.mu.Unlock()
+		if msg.BWE < minBWE || msg.BWE > maxBWE {
+			return nil
+		}
+		p.mu.Lock()
+		prev := p.lastBWE
+		p.bwe = msg.BWE
+		changed := prev == 0 || abs(msg.BWE-prev)*100/max(prev, 1) >= 20
+		if changed {
+			p.lastBWE = msg.BWE
+		}
+		p.mu.Unlock()
+		if changed {
 			r.retarget(userID)
 		}
 	}
 	return nil
 }
 
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func (r *Room) SetBandwidth(userID string, bps int) {
 	_ = r.Signal(userID, mustJSON(Message{Type: "bwe", BWE: bps}))
 }
 
-func (r *Room) Leave(userID string) bool {
+func (r *Room) Leave(sess *Session) bool {
+	if sess == nil || sess.peer == nil {
+		return r.Empty()
+	}
+	r.mu.Lock()
+	p := r.peers[sess.userID]
+	if p != sess.peer {
+		empty := len(r.peers) == 0
+		r.mu.Unlock()
+		return empty
+	}
+	return r.leaveLocked(sess.userID, p)
+}
+
+func (r *Room) ForceLeave(userID string) bool {
 	r.mu.Lock()
 	p := r.peers[userID]
+	if p == nil {
+		empty := len(r.peers) == 0
+		r.mu.Unlock()
+		return empty
+	}
+	return r.leaveLocked(userID, p)
+}
+
+func (r *Room) leaveLocked(userID string, p *peer) bool {
 	delete(r.peers, userID)
 	others := make([]*peer, 0, len(r.peers))
 	for _, other := range r.peers {
 		others = append(others, other)
 	}
-	var published []*webrtc.TrackLocalStaticRTP
-	if p != nil {
-		published = append(published, p.published...)
+	published := append([]*webrtc.TrackLocalStaticRTP(nil), p.published...)
+	for _, src := range r.sources {
+		if src.from != userID {
+			continue
+		}
+		src.mu.Lock()
+		for _, fwd := range src.outs {
+			if fwd.local != nil {
+				published = append(published, fwd.local)
+			}
+		}
+		src.mu.Unlock()
 	}
 	empty := len(r.peers) == 0
 	r.dropSourcesLocked(userID)
 	r.mu.Unlock()
-	if p != nil {
-		p.cancel()
-		_ = p.pc.Close()
-	}
+	p.cancel()
+	_ = p.pc.Close()
 	for _, other := range others {
 		if other.removeTracks(published) {
 			if err := other.negotiate(); err != nil {
@@ -387,7 +552,7 @@ func (r *Room) Leave(userID string) bool {
 
 func (r *Room) Kick(userID, reason string) bool {
 	r.writeTo(userID, Message{Type: reason, UserID: userID})
-	return r.Leave(userID)
+	return r.ForceLeave(userID)
 }
 
 func (p *peer) removeTracks(tracks []*webrtc.TrackLocalStaticRTP) bool {
@@ -514,7 +679,7 @@ func (r *Room) broadcast(except string, msg Message) {
 	}
 }
 
-func pump(ctx context.Context, remote *webrtc.TrackRemote, local *webrtc.TrackLocalStaticRTP, in, out *atomic.Uint64) {
+func pump(ctx context.Context, remote *webrtc.TrackRemote, local *webrtc.TrackLocalStaticRTP, owner *peer, in, out *atomic.Uint64, room *Room) {
 	buf := make([]byte, 1500)
 	for {
 		if ctx.Err() != nil {
@@ -526,10 +691,21 @@ func pump(ctx context.Context, remote *webrtc.TrackRemote, local *webrtc.TrackLo
 			if ctx.Err() != nil {
 				return
 			}
-			continue
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				continue
+			}
+			return
 		}
 		if in != nil {
 			in.Add(uint64(n))
+		}
+		if remote.Kind() == webrtc.RTPCodecTypeAudio && owner != nil && room != nil {
+			pkt := &rtp.Packet{}
+			if pkt.Unmarshal(buf[:n]) == nil {
+				if level, ok := audioLevel(pkt); ok {
+					room.markSpeaking(owner.userID, speaking(level))
+				}
+			}
 		}
 		if _, err := local.Write(buf[:n]); err != nil {
 			return

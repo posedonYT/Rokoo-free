@@ -250,6 +250,18 @@ func (p *Postgres) ListMessages(ctx context.Context, channelID int64, before int
 	return out, nil
 }
 
+// DeleteByChannelIDs hard-deletes all messages (attachments cascade) of the given guild channels.
+func (p *Postgres) DeleteByChannelIDs(ctx context.Context, channelIDs []int64) (int64, error) {
+	if len(channelIDs) == 0 {
+		return 0, nil
+	}
+	tag, err := p.pool.Exec(ctx, `DELETE FROM messages WHERE channel_id = ANY($1) AND channel_kind = $2`, channelIDs, domain.KindGuild)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 func (p *Postgres) attachments(ctx context.Context, messageIDs []int64) ([]domain.Attachment, error) {
 	if len(messageIDs) == 0 {
 		return nil, nil

@@ -21,6 +21,7 @@ import (
 	"rokko.dev/pkg/grpcx"
 	"rokko.dev/pkg/kafkax"
 	"rokko.dev/pkg/logger"
+	"rokko.dev/pkg/redisx"
 	"rokko.dev/services/voice/internal/access"
 	voicecfg "rokko.dev/services/voice/internal/config"
 	"rokko.dev/services/voice/internal/registry"
@@ -61,9 +62,9 @@ func main() {
 	var reg *registry.Registry
 	var rdb *redis.Client
 	if cfg.RedisAddr != "" {
-		rdb = redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Password: cfg.RedisPassword})
+		rdb = redisx.New(redisx.Config{Addr: cfg.RedisAddr, Password: cfg.RedisPassword})
 		defer rdb.Close()
-		if err := rdb.Ping(ctx).Err(); err != nil {
+		if err := redisx.Ping(ctx, rdb); err != nil {
 			log.Fatal("redis", zap.Error(err))
 		}
 		reg = registry.New(rdb, 15*time.Second)
@@ -123,7 +124,7 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					_ = reg.UpsertNode(ctx, registry.Node{ID: nodeID, URL: publicURL})
+					srv.RefreshRooms(ctx)
 				}
 			}
 		}()

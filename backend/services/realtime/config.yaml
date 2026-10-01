@@ -7,3 +7,8 @@ kafka_brokers:
 public_key_path: ../../deploy/keys/ed25519.pub
 issuer: rokko
 user_service_addr: localhost:50052
+guild_service_addr: localhost:50053
+message_service_addr: localhost:50054
+origins:
+  - localhost:*
+  - 127.0.0.1:*
